@@ -1,5 +1,6 @@
 # PanUpLoad — 多网盘备份工具
 
+本项目由 AI 辅助编程完成。
 一键将本地文件/文件夹同时备份到多个云盘。
 
 ## 支持的网盘
@@ -74,9 +75,7 @@ python -m pytest tests/ -v
 python -m PyInstaller panupdate.spec
 ```
 
-## 致谢
 
-本项目由 AI 辅助编程完成。
 
 ## 技术栈
 

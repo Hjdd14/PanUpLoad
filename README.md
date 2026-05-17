@@ -74,6 +74,10 @@ python -m pytest tests/ -v
 python -m PyInstaller panupdate.spec
 ```
 
+## 致谢
+
+本项目由 AI 辅助编程完成。
+
 ## 技术栈
 
 - Python 3.11+

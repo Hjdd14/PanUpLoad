@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+
+# Project specific
+项目规划.jpg
+test_login_dump.txt
+flet-windows.zip
+pythonnet-*.tar.gz
+.pytest_cache/
+*.spec
+!panupdate.spec
+
+# OS
+Thumbs.db
+.DS_Store

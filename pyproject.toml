@@ -1,0 +1,24 @@
+[project]
+name = "panupdate"
+version = "0.1.0"
+description = "Multi-cloud disk backup tool"
+requires-python = ">=3.11"
+dependencies = [
+    "flet>=0.27.0",
+    "httpx>=0.27.0",
+    "cryptography>=41.0.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    "selenium>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.10.0",
+    "pip-tools",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

@@ -128,12 +128,13 @@ class TestBackupEngine:
         assert len(progress_log) >= 2
         assert progress_log[-1] == 1.0
 
-    def test_cancel_job(self, engine, temp_files):
+    @pytest.mark.asyncio
+    async def test_cancel_job(self, engine, temp_files):
         dests = [BackupDestination("baidu", "my_baidu", 1, "/backup")]
         job = engine.create_job([str(temp_files / "f1.txt")], dests)
-        assert engine.cancel_job(job.id) is True
+        assert await engine.cancel_job(job.id) is True
         assert engine.get_job(job.id).status == "cancelled"
-        assert engine.cancel_job("nonexistent") is False
+        assert await engine.cancel_job("nonexistent") is False
 
     def test_get_progress(self, engine, temp_files):
         dests = [BackupDestination("baidu", "my_baidu", 1, "/backup")]

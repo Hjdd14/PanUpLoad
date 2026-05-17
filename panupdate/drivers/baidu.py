@@ -35,7 +35,8 @@ BAIDU_FILE_META = "https://pan.baidu.com/api/filemetas"
 BAIDU_APP_ID = "250528"
 BAIDU_WEB_PARAMS = f"app_id={BAIDU_APP_ID}&channel=chunlei&web=1&clienttype=0"
 
-BLOCK_SIZE = 4 * 1024 * 1024  # 4 MB
+BLOCK_SIZE = 4 * 1024 * 1024  # 4 MB (Baidu server constraint)
+UPLOAD_CONCURRENCY = 3        # max concurrent block uploads
 
 
 class BaiduDriver(CloudDriver):
@@ -388,13 +389,19 @@ class BaiduDriver(CloudDriver):
         log_upload_event(f"  uploadid={uploadid}")
 
         # ── Step 2: superfile2 (upload binary to PCS CDN) ─────────────
-        # Each block (4MB chunk) must be uploaded separately with the
-        # correct partseq.  Multi-block files fail with create errno=10
-        # if blocks are missing on the server.
+        # Each block (4MB chunk) is uploaded independently. Blocks are
+        # uploaded concurrently with a shared HTTP client for connection
+        # pooling. The server accepts out-of-order blocks (keyed by partseq).
         num_blocks = len(block_list)
-        log_upload_event(f"  superfile2 上传 {num_blocks} 块 ({file_size} bytes)...")
+        log_upload_event(f"  superfile2 上传 {num_blocks} 块并发 (并发 {UPLOAD_CONCURRENCY})...")
 
-        for block_idx in range(num_blocks):
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        progress_lock = asyncio.Lock()
+        total_uploaded = 0
+        block_errors: list[Exception] = []
+
+        async def _upload_one_block(block_idx: int) -> None:
+            nonlocal total_uploaded
             with open(local_path, "rb") as f:
                 f.seek(block_idx * BLOCK_SIZE)
                 block_data = f.read(BLOCK_SIZE)
@@ -412,25 +419,15 @@ class BaiduDriver(CloudDriver):
                 "dp-logid": dp_logid,
             }
 
-            pcs_domains = [
-                "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2",
-            ]
+            sf2_url = "https://d.pcs.baidu.com/rest/2.0/pcs/superfile2"
+            cookie = self._build_cookie_header()
 
-            resp = None
-            for sf2_url in pcs_domains:
-                async with httpx.AsyncClient(timeout=600.0) as client:
-                    resp = await client.post(
-                        sf2_url,
-                        params=sf2_params,
-                        files={"file": (file_name, block_data, "application/octet-stream")},
-                        headers={
-                            "Accept-Encoding": "identity",
-                            "Cookie": self._build_cookie_header(),
-                        },
-                    )
-                if resp.status_code < 500:
-                    break
-                log_upload_event(f"  {sf2_url} -> {resp.status_code}, trying next...")
+            async with sem:
+                resp = await oss_client.post(
+                    sf2_url, params=sf2_params,
+                    files={"file": (file_name, block_data, "application/octet-stream")},
+                    headers={"Accept-Encoding": "identity", "Cookie": cookie},
+                )
 
             log_upload_event(f"  superfile2 块 {block_idx}: HTTP {resp.status_code}")
             if resp.status_code >= 400:
@@ -439,8 +436,25 @@ class BaiduDriver(CloudDriver):
             sf2_body = self._safe_json(resp, "superfile2")
             log_upload_event(f"  superfile2 body: {json.dumps(sf2_body, ensure_ascii=False)[:300]}")
 
-            if progress_callback:
-                progress_callback(min((block_idx + 1) * BLOCK_SIZE, file_size), file_size)
+            async with progress_lock:
+                total_uploaded += len(block_data)
+                if progress_callback:
+                    progress_callback(total_uploaded, file_size)
+
+        # Shared HTTP client with connection pooling for all block uploads
+        oss_client = httpx.AsyncClient(timeout=600.0)
+        try:
+            tasks = [asyncio.create_task(_upload_one_block(i)) for i in range(num_blocks)]
+            for task in tasks:
+                try:
+                    await task
+                except Exception as e:
+                    block_errors.append(e)
+        finally:
+            await oss_client.aclose()
+
+        if block_errors:
+            raise Exception(f"块上传失败: {len(block_errors)}/{num_blocks} 个块出错")
 
         # ── Step 3: create (commit) ────────────────────────────────────
         # The browser calls this "create" — it finalizes the upload.

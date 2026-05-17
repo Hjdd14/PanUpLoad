@@ -103,3 +103,7 @@ class CloudDriver(ABC):
     async def test_connection(self) -> bool:
         """Test if the current account credentials are valid."""
         ...
+
+    async def close(self):
+        """Close HTTP clients or release resources. No-op by default."""
+        pass

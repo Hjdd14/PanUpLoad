@@ -25,6 +25,15 @@ QUARK_UPLOAD_FINISH = QUARK_BASE + "/file/upload/finish"
 
 DRIVE_PARAMS = {"pr": "ucpro", "fr": "pc", "uc_param_str": ""}
 
+# Upload strategy constants
+MULTIPART_THRESHOLD = 5 * 1024 * 1024   # 5MB — switch to multipart above this
+CHUNK_SIZE = 4 * 1024 * 1024             # 4MB — upload chunk size
+UPLOAD_CONCURRENCY = 3                  # max concurrent part uploads
+MAX_RETRIES = 3                          # max retries per part
+
+# OSS user-agent strings (matching QuarkPan reference)
+_OSS_UA_PUT = "aliyun-sdk-js/1.0.0 Chrome Mobile 139.0.0.0 on Google Nexus 5 (Android 6.0)"
+_OSS_UA_POST = "aliyun-sdk-js/1.0.0 Chrome 139.0.0.0 on OS X 10.15.7 64-bit"
 
 class KuaikeDriver(CloudDriver):
     """夸克云盘 driver — based on QuarkPan open-source implementation."""
@@ -92,15 +101,26 @@ class KuaikeDriver(CloudDriver):
             "Referer": "https://pan.quark.cn/",
         }
 
-    # ── upload_file (based on QuarkPan) ──────────────────────────────
+    # ── upload_file dispatcher ─────────────────────────────────────────
 
     async def upload_file(
+        self, local_path: str, remote_dir: str, progress_callback=None,
+    ) -> str:
+        self._ensure_token()              # validate login first
+        file_size = os.path.getsize(local_path)
+        if file_size < MULTIPART_THRESHOLD:
+            return await self._upload_single(local_path, remote_dir, progress_callback)
+        return await self._upload_multipart(local_path, remote_dir, progress_callback)
+
+    # ── single-part upload (< 5MB) ────────────────────────────────────
+
+    async def _upload_single(
         self, local_path: str, remote_dir: str, progress_callback=None,
     ) -> str:
         tok = self._ensure_token()
         file_name = os.path.basename(local_path)
         file_size = os.path.getsize(local_path)
-        log_upload_event(f"  Kuaike 上传开始: {file_name} ({file_size} bytes)")
+        log_upload_event(f"  Kuaike 单分片上传: {file_name} ({file_size} bytes)")
 
         parent_id = await self._ensure_folder_path(remote_dir, tok)
 
@@ -148,12 +168,12 @@ class KuaikeDriver(CloudDriver):
         log_upload_event(f"  update/hash: HTTP {resp.status_code}")
         resp.raise_for_status()
 
-        # Step 3: get upload auth (single part)
+        # Step 3: get upload auth (partNumber=1, no hash_ctx)
         oss_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         auth_meta = (
             f"PUT\n\n{mime_type}\n{oss_date}\n"
             f"x-oss-date:{oss_date}\n"
-            f"x-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome 148.0.0.0 on Windows 10 64-bit\n"
+            f"x-oss-user-agent:{_OSS_UA_PUT}\n"
             f"/{bucket}/{obj_key}?partNumber=1&uploadId={upload_id}"
         )
         auth_data = {
@@ -173,29 +193,27 @@ class KuaikeDriver(CloudDriver):
             raise Exception(f"upload auth failed: {auth_resp.get('message')}")
         auth_key = auth_resp.get("data", {}).get("auth_key", "")
 
-        # Step 4: PUT file to OSS (try multiple URL formats)
+        # Step 4: PUT file to OSS
         oss_urls = [
-            f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?partNumber=1&uploadId={upload_id}",
             f"https://{bucket}.pds.quark.cn/{obj_key}?partNumber=1&uploadId={upload_id}",
+            f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?partNumber=1&uploadId={upload_id}",
             f"http://pds.quark.cn/{obj_key}?partNumber=1&uploadId={upload_id}",
         ]
-        oss_url = oss_urls[0]
         oss_headers = {
             "Content-Type": mime_type,
             "x-oss-date": oss_date,
-            "x-oss-user-agent": "aliyun-sdk-js/1.0.0 Chrome 148.0.0.0 on Windows 10 64-bit",
+            "x-oss-user-agent": _OSS_UA_PUT,
         }
         if auth_key:
             oss_headers["authorization"] = auth_key
 
-        with open(local_path, "rb") as f:
-            file_data = f.read()
-        # Try multiple OSS URL formats
         oss_success = False
         etag = ""
         for oss_url in oss_urls:
             log_upload_event(f"  PUT OSS: {oss_url[:80]}...")
             async with httpx.AsyncClient(timeout=600.0, verify=False) as client:
+                with open(local_path, "rb") as f:
+                    file_data = f.read()
                 resp = await client.put(oss_url, content=file_data, headers=oss_headers)
                 log_upload_event(f"  PUT: HTTP {resp.status_code}")
                 if resp.status_code == 200:
@@ -206,7 +224,10 @@ class KuaikeDriver(CloudDriver):
         if not oss_success:
             raise Exception("OSS PUT failed with all URL formats")
 
-        # Step 5: POST-complete auth (with XML)
+        # Step 5: send CORS preflight for POST auth (required by Quark API)
+        await self._send_cors_preflight(headers)
+
+        # Step 6: POST-complete auth
         xml_data = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<CompleteMultipartUpload>\n'
@@ -221,7 +242,7 @@ class KuaikeDriver(CloudDriver):
             f"POST\n{xml_md5}\napplication/xml\n{oss_date}\n"
             f"x-oss-callback:{cb_b64}\n"
             f"x-oss-date:{oss_date}\n"
-            f"x-oss-user-agent:aliyun-sdk-js/1.0.0 Chrome 148.0.0.0 on Windows 10 64-bit\n"
+            f"x-oss-user-agent:{_OSS_UA_POST}\n"
             f"/{bucket}/{obj_key}?uploadId={upload_id}"
         )
         post_auth_data = {
@@ -238,14 +259,13 @@ class KuaikeDriver(CloudDriver):
         resp.raise_for_status()
         post_auth = resp.json()
         if not post_auth.get("status"):
-            # POST-complete auth failure is not fatal — file may still upload
             log_upload_event(f"  complete/auth warning: {post_auth.get('message', '')}")
         post_auth_key = post_auth.get("data", {}).get("auth_key", "")
         post_upload_url = oss_url.replace("?partNumber=1&", "?")
         post_headers = {
             "Content-Type": "application/xml",
             "x-oss-date": oss_date,
-            "x-oss-user-agent": "aliyun-sdk-js/1.0.0 Chrome 148.0.0.0 on Windows 10 64-bit",
+            "x-oss-user-agent": _OSS_UA_POST,
             "x-oss-callback": cb_b64,
             "Content-MD5": xml_md5,
         }
@@ -270,17 +290,305 @@ class KuaikeDriver(CloudDriver):
             progress_callback(file_size, file_size)
 
         fid = str(pre_d.get("fid", task_id))
-        log_upload_event(f"  Kuaike 上传成功 fid={fid}")
+        log_upload_event(f"  Kuaike 单分片上传成功 fid={fid}")
         return fid
 
+    # ── multipart upload (>= 5MB) ─────────────────────────────────────
+
+    async def _upload_multipart(
+        self, local_path: str, remote_dir: str, progress_callback=None,
+    ) -> str:
+        tok = self._ensure_token()
+        file_name = os.path.basename(local_path)
+        file_size = os.path.getsize(local_path)
+        log_upload_event(f"  Kuaike 分片上传: {file_name} ({file_size} bytes)")
+
+        parent_id = await self._ensure_folder_path(remote_dir, tok)
+
+        import mimetypes as _mime
+        mime_type = _mime.guess_type(file_name)[0] or "application/octet-stream"
+
+        # Compute file hashes (fast C-accelerated MD5 + SHA1)
+        md5_hash, sha1_hash = self._hash_file(local_path)
+
+        # Step 1: upload/pre
+        now_ms = int(time.time() * 1000)
+        pre_data = {
+            "ccp_hash_update": True,
+            "pdir_fid": parent_id,
+            "dir_name": "",
+            "size": file_size,
+            "file_name": file_name,
+            "format_type": mime_type,
+            "l_updated_at": now_ms,
+            "l_created_at": now_ms,
+        }
+        headers = self._headers(tok)
+        resp = await self._http.post(
+            QUARK_UPLOAD_PRE, headers=headers, json=pre_data, params=DRIVE_PARAMS,
+        )
+        log_upload_event(f"  upload/pre: HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            log_upload_event(f"  响应体: {resp.text[:300]}")
+        resp.raise_for_status()
+        pre = resp.json()
+        pre_d = pre.get("data", pre)
+        task_id = pre_d["task_id"]
+        auth_info = pre_d.get("auth_info", "")
+        upload_id = pre_d.get("upload_id", "")
+        obj_key = pre_d.get("obj_key", "")
+        bucket = pre_d.get("bucket", "ul-zb")
+        callback_info = pre_d.get("callback", {})
+        # Use server-specified part_size if available
+        part_size = pre_d.get("part_size", CHUNK_SIZE)
+
+        # Step 2: update file hash
+        hash_data = {"task_id": task_id, "md5": md5_hash, "sha1": sha1_hash}
+        resp = await self._http.post(
+            QUARK_UPDATE_HASH, headers=headers, json=hash_data, params=DRIVE_PARAMS,
+        )
+        log_upload_event(f"  update/hash: HTTP {resp.status_code}")
+        resp.raise_for_status()
+
+        # Step 3: compute number of parts (skip expensive pure-Python SHA1
+        # context — OSS doesn't require x-oss-hash-ctx for upload to work)
+        num_parts = (file_size + part_size - 1) // part_size
+        log_upload_event(f"  分片上传: {num_parts} 个分片, 每分片 {part_size} bytes")
+
+        # Step 4: upload parts concurrently (sharing one OSS client for connection pooling)
+        sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
+        results_lock = asyncio.Lock()
+        uploaded_parts: list[tuple[int, str]] = []
+        total_uploaded = 0
+
+        async def _upload_one_part(part_number: int, offset: int,
+                                    current_part_size: int) -> str | None:
+            nonlocal total_uploaded
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    oss_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+                    async with sem:
+                        etag = await self._upload_part(
+                            task_id, mime_type, part_number, auth_info, upload_id,
+                            obj_key, bucket, local_path, offset, current_part_size,
+                            oss_date, headers,
+                            oss_client=oss_client,
+                        )
+                    log_upload_event(f"  分片 {part_number} 成功, etag={etag}")
+                    async with results_lock:
+                        uploaded_parts.append((part_number, etag))
+                        total_uploaded += current_part_size
+                        if progress_callback:
+                            progress_callback(total_uploaded, file_size)
+                    return etag
+                except Exception as e:
+                    log_upload_event(f"  分片 {part_number} 尝试 {attempt+1} 失败: {e}")
+                    if attempt < MAX_RETRIES:
+                        wait = min(2 ** attempt, 10)
+                        log_upload_event(f"  等待 {wait}s 后重试...")
+                        await asyncio_sleep(wait)
+            # All retries exhausted — raise so gather(return_exceptions=True) captures it
+            raise Exception(f"分片 {part_number} 上传失败 ({MAX_RETRIES+1} 次重试)")
+
+        oss_client = httpx.AsyncClient(timeout=600.0, verify=False)
+        try:
+            tasks = []
+            for part_number in range(1, num_parts + 1):
+                offset = (part_number - 1) * part_size
+                current_part_size = min(part_size, file_size - offset)
+                log_upload_event(f"  启动分片 {part_number}/{num_parts} (并发 {UPLOAD_CONCURRENCY})")
+                tasks.append(_upload_one_part(part_number, offset, current_part_size))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Check for failures — don't cascade; allow other parts to finish
+            failures = [(i + 1, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+            if failures:
+                for pn, err in failures:
+                    log_upload_event(f"  分片 {pn} 最终失败 (不级联): {err}")
+        finally:
+            await oss_client.aclose()
+
+        uploaded_parts.sort(key=lambda x: x[0])
+
+        if not uploaded_parts:
+            raise Exception("分片上传失败: 所有分片均未成功")
+        if len(uploaded_parts) < num_parts:
+            log_upload_event(f"  警告: {len(uploaded_parts)}/{num_parts} 个分片成功，部分分片失败")
+
+        # Step 5: build CompleteMultipartUpload XML
+        xml_parts = []
+        for pn, et in uploaded_parts:
+            xml_parts.append(
+                f'<Part>\n<PartNumber>{pn}</PartNumber>\n<ETag>"{et}"</ETag>\n</Part>'
+            )
+        xml_data = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<CompleteMultipartUpload>\n'
+            + '\n'.join(xml_parts)
+            + '\n</CompleteMultipartUpload>'
+        )
+
+        # Step 6: send CORS preflight for POST auth (required by Quark API)
+        await self._send_cors_preflight(headers)
+
+        # Step 7: POST-complete auth + upload
+        oss_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        xml_md5 = _base64.b64encode(hashlib.md5(xml_data.encode()).digest()).decode()
+        cb_b64 = _base64.b64encode(
+            _json.dumps(callback_info, separators=(",", ":")).encode()
+        ).decode()
+        post_meta = (
+            f"POST\n{xml_md5}\napplication/xml\n{oss_date}\n"
+            f"x-oss-callback:{cb_b64}\n"
+            f"x-oss-date:{oss_date}\n"
+            f"x-oss-user-agent:{_OSS_UA_POST}\n"
+            f"/{bucket}/{obj_key}?uploadId={upload_id}"
+        )
+        post_auth_data = {
+            "task_id": task_id,
+            "auth_info": auth_info,
+            "auth_meta": post_meta,
+        }
+        resp = await self._http.post(
+            QUARK_UPLOAD_AUTH, headers=headers, json=post_auth_data, params=DRIVE_PARAMS,
+        )
+        log_upload_event(f"  complete/auth: HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            log_upload_event(f"  响应体: {resp.text[:300]}")
+        resp.raise_for_status()
+        post_auth = resp.json()
+        if not post_auth.get("status"):
+            log_upload_event(f"  complete/auth warning: {post_auth.get('message', '')}")
+        post_auth_key = post_auth.get("data", {}).get("auth_key", "")
+        post_upload_url = (
+            f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?uploadId={upload_id}"
+        )
+        post_headers = {
+            "Content-Type": "application/xml",
+            "x-oss-date": oss_date,
+            "x-oss-user-agent": _OSS_UA_POST,
+            "x-oss-callback": cb_b64,
+            "Content-MD5": xml_md5,
+        }
+        if post_auth_key:
+            post_headers["authorization"] = post_auth_key
+
+        post_oss_urls = [
+            f"https://{bucket}.pds.quark.cn/{obj_key}?uploadId={upload_id}",
+            f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?uploadId={upload_id}",
+        ]
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            for post_url in post_oss_urls:
+                resp = await client.post(post_url, content=xml_data, headers=post_headers)
+                log_upload_event(f"  POST complete {post_url[:80]}: HTTP {resp.status_code}")
+                if resp.status_code in (200, 203):
+                    break
+                log_upload_event(f"  POST complete body: {resp.text[:300]}")
+
+        # Step 8: finish upload
+        finish_data = {"task_id": task_id, "obj_key": obj_key}
+        resp = await self._http.post(
+            QUARK_UPLOAD_FINISH, headers=headers, json=finish_data, params=DRIVE_PARAMS,
+        )
+        log_upload_event(f"  upload/finish: HTTP {resp.status_code}")
+        resp.raise_for_status()
+
+        if progress_callback:
+            progress_callback(file_size, file_size)
+
+        fid = str(pre_d.get("fid", task_id))
+        log_upload_event(f"  Kuaike 分片上传成功 fid={fid}, {num_parts} 个分片")
+        return fid
+
+    async def _upload_part(
+        self, task_id: str, mime_type: str, part_number: int,
+        auth_info: str, upload_id: str, obj_key: str, bucket: str,
+        local_path: str, offset: int, part_size: int,
+        oss_date: str, headers: dict,
+        oss_client: httpx.AsyncClient | None = None,
+    ) -> str:
+        """Upload a single part: get auth → PUT to OSS → return ETag.
+
+        If oss_client is provided, it will be reused for OSS PUT calls
+        (enables connection pooling across concurrent parts).
+        """
+        auth_meta_str = (
+            f"PUT\n\n{mime_type}\n{oss_date}\n"
+            f"x-oss-date:{oss_date}\n"
+            f"x-oss-user-agent:{_OSS_UA_PUT}\n"
+            f"/{bucket}/{obj_key}?partNumber={part_number}&uploadId={upload_id}"
+        )
+
+        auth_data = {
+            "task_id": task_id,
+            "auth_info": auth_info,
+            "auth_meta": auth_meta_str,
+        }
+        resp = await self._http.post(
+            QUARK_UPLOAD_AUTH, headers=headers, json=auth_data, params=DRIVE_PARAMS,
+        )
+        log_upload_event(f"  part {part_number} auth: HTTP {resp.status_code}")
+        if resp.status_code >= 400:
+            log_upload_event(f"  响应体: {resp.text[:300]}")
+        resp.raise_for_status()
+        auth_resp = resp.json()
+        if auth_resp.get("code", 0) != 0:
+            raise Exception(
+                f"part {part_number} auth failed: {auth_resp.get('message')}"
+            )
+        auth_key = auth_resp.get("data", {}).get("auth_key", "")
+
+        # Build OSS headers
+        oss_headers = {
+            "Content-Type": mime_type,
+            "x-oss-date": oss_date,
+            "x-oss-user-agent": _OSS_UA_PUT,
+        }
+        if auth_key:
+            oss_headers["authorization"] = auth_key
+
+        # Read the part data
+        with open(local_path, "rb") as f:
+            f.seek(offset)
+            part_data = f.read(part_size)
+
+        # Try multiple OSS URL formats
+        oss_urls = [
+            f"https://{bucket}.pds.quark.cn/{obj_key}?partNumber={part_number}&uploadId={upload_id}",
+            f"https://{bucket}.oss-cn-shenzhen.aliyuncs.com/{obj_key}?partNumber={part_number}&uploadId={upload_id}",
+            f"http://pds.quark.cn/{obj_key}?partNumber={part_number}&uploadId={upload_id}",
+        ]
+        own_client = oss_client is None
+        if own_client:
+            oss_client = httpx.AsyncClient(timeout=600.0, verify=False)
+        try:
+            for oss_url in oss_urls:
+                log_upload_event(f"  PUT OSS part {part_number}: {oss_url[:80]}...")
+                resp = await oss_client.put(oss_url, content=part_data, headers=oss_headers)
+                log_upload_event(f"  PUT part {part_number}: HTTP {resp.status_code}")
+                if resp.status_code == 200:
+                    etag = resp.headers.get("etag", "").strip('"')
+                    return etag
+                log_upload_event(f"  PUT 响应体: {resp.text[:200]}")
+        finally:
+            if own_client:
+                await oss_client.aclose()
+
+        raise Exception(f"part {part_number} OSS PUT failed with all URL formats")
+
+    # ── file hashing ───────────────────────────────────────────────────
+
     @staticmethod
-    def _hash_file(path: str):
+    def _hash_file(path):
+        """Fast C-accelerated MD5 + SHA1 hashing. Reads file once in 8KB chunks."""
         md5_h = hashlib.md5()
         sha1_h = hashlib.sha1()
+
         with open(path, "rb") as f:
             while chunk := f.read(8192):
                 md5_h.update(chunk)
                 sha1_h.update(chunk)
+
         return md5_h.hexdigest(), sha1_h.hexdigest()
 
     # ── folder operations ─────────────────────────────────────────────
@@ -408,3 +716,27 @@ class KuaikeDriver(CloudDriver):
 
     def _params(self, token: str, **extra) -> dict:
         return {**extra}
+
+    async def _send_cors_preflight(self, headers: dict) -> None:
+        """Send CORS preflight OPTIONS before POST auth (required by Quark API)."""
+        try:
+            options_headers = {
+                "accept": "*/*",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "access-control-request-headers": "content-type",
+                "access-control-request-method": "POST",
+                "cache-control": "no-cache",
+                "origin": "https://pan.quark.cn",
+                "pragma": "no-cache",
+                "referer": "https://pan.quark.cn/",
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                await client.options(QUARK_UPLOAD_AUTH, headers=options_headers, params=DRIVE_PARAMS)
+        except Exception:
+            pass  # preflight failure is non-fatal
+
+
+# Helper: asyncio.sleep for use inside retry loops
+import asyncio as _asyncio
+import asyncio
+asyncio_sleep = _asyncio.sleep

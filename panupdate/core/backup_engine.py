@@ -68,7 +68,9 @@ class BackupEngine:
         self._file_scanner = file_scanner or FileScanner()
         self._db = db
         self._jobs: dict[str, BackupJob] = {}
+        self._job_drivers: dict[str, dict[int, CloudDriver]] = {}
         self._progress_callbacks: dict[str, Callable[[str, float], None]] = {}
+        self._task_progress: dict[str, dict[str, float]] = {}
 
     def create_job(
         self,
@@ -145,6 +147,7 @@ class BackupEngine:
             raise ValueError(f"Job not found: {job_id}")
 
         job.status = "running"
+        self._job_drivers[job_id] = drivers
         job.tasks = self._build_tasks(job)
         job.total_tasks = len(job.tasks)
 
@@ -198,7 +201,7 @@ class BackupEngine:
                     driver=drv,
                     local_path=ti.source_path,
                     remote_dir=ti.remote_dir,
-                    progress_callback=lambda tid, p: self._on_task_progress(job_id, p),
+                    progress_callback=lambda tid, p: self._on_task_progress(job_id, tid, p),
                 )
                 ti.status = "success" if result.success else "failed"
                 ti.file_id = result.file_id
@@ -221,6 +224,11 @@ class BackupEngine:
 
         await asyncio.gather(*upload_coros, return_exceptions=True)
 
+        # If job was cancelled while uploading, return immediately.
+        # cancel_job already cleaned up drivers and updated DB.
+        if job.status == "cancelled":
+            return job
+
         job.status = "completed"
         job.completed_at = time.time()
 
@@ -241,16 +249,40 @@ class BackupEngine:
 
         return job
 
-    def cancel_job(self, job_id: str) -> bool:
-        """Cancel a running backup job."""
+    async def cancel_job(self, job_id: str) -> bool:
+        """Cancel a running backup job, stopping all uploads and closing drivers."""
         job = self._jobs.get(job_id)
         if not job:
             return False
+
         job.status = "cancelled"
         job.completed_at = time.time()
+
+        # Cancel all active uploads immediately
+        await self._upload_manager.cancel_all()
+
+        # Close all drivers associated with this job
+        drivers = self._job_drivers.pop(job_id, {})
+        for driver in drivers.values():
+            try:
+                await driver.close()
+            except Exception:
+                pass
+
         if self._db:
             self._db.update_job(job_id, status="cancelled", completed_at=job.completed_at)
         return True
+
+    async def close_all(self):
+        """Close all drivers and cancel any remaining uploads (app shutdown)."""
+        await self._upload_manager.cancel_all()
+        for _jid, drivers in self._job_drivers.items():
+            for driver in drivers.values():
+                try:
+                    await driver.close()
+                except Exception:
+                    pass
+        self._job_drivers.clear()
 
     def get_job(self, job_id: str) -> BackupJob | None:
         return self._jobs.get(job_id)
@@ -263,7 +295,10 @@ class BackupEngine:
         job = self._jobs.get(job_id)
         if not job or job.total_tasks == 0:
             return 0.0
-        return job.completed_tasks / job.total_tasks
+        progresses = self._task_progress.get(job_id, {})
+        if not progresses:
+            return job.completed_tasks / job.total_tasks
+        return sum(progresses.values()) / job.total_tasks
 
     def _find_destination(self, job: BackupJob, account_id: int) -> BackupDestination | None:
         for d in job.destinations:
@@ -271,8 +306,10 @@ class BackupEngine:
                 return d
         return None
 
-    def _on_task_progress(self, job_id: str, task_progress: float) -> None:
-        """Called by UploadManager when a single task reports progress."""
+    def _on_task_progress(self, job_id: str, task_id: str, task_progress: float) -> None:
+        """Called by UploadManager when a single task reports byte-level progress."""
+        progresses = self._task_progress.setdefault(job_id, {})
+        progresses[task_id] = task_progress
         self._notify_progress(job_id)
 
     def _notify_progress(self, job_id: str) -> None:

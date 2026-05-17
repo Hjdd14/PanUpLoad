@@ -77,7 +77,6 @@ a = Analysis(
         "panupdate.ui.app",
         "panupdate.ui.login_page",
         "panupdate.ui.backup_page",
-        "panupdate.ui.status_page",
         "panupdate.ui.settings_page",
         "panupdate.ui.components",
         "panupdate.ui.components.drive_card",

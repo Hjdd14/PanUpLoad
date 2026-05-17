@@ -306,7 +306,7 @@ class BackupPage(ft.Container):
         """Run backup job and update UI with progress."""
         def on_progress(_jid: str, pct: float):
             self._overall_progress.value = pct
-            self._status_text.value = f"备份中... {int(pct * 100)}%"
+            self._status_text.value = f"备份中... {max(1, int(pct * 100))}%"
             self.update()
 
         job = await self._engine.start_job(job_id, drivers, progress_callback=on_progress)
@@ -346,13 +346,26 @@ class BackupPage(ft.Container):
     def _on_cancel(self, e):
         """Cancel the current backup job."""
         if self._current_job_id:
-            self._engine.cancel_job(self._current_job_id)
-            self._status_text.value = "备份已取消"
+            self._status_text.value = "正在取消..."
             self._status_text.color = ft.Colors.ORANGE
-            self._start_btn.disabled = False
             self._cancel_btn.disabled = True
-            self._is_running = False
             self.update()
+            if self.page:
+                self.page.run_task(self._do_cancel_job)
+
+    async def _do_cancel_job(self):
+        """Async cancellation: stop uploads, close drivers, update UI."""
+        await self._engine.cancel_job(self._current_job_id)
+        self._status_text.value = "备份已取消"
+        self._status_text.color = ft.Colors.ORANGE
+        self._start_btn.disabled = False
+        self._is_running = False
+        self.update()
+
+    async def close(self):
+        """Cleanup on app shutdown: cancel any running job."""
+        if self._current_job_id and self._is_running:
+            await self._engine.cancel_job(self._current_job_id)
 
     def _restore_driver(self, provider: str, account_name: str,
                         access_token: str, refresh_token: str,

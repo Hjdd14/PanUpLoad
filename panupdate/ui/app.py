@@ -80,6 +80,17 @@ class PanUpLoadApp:
 
         page.add(self._tabs)
 
+        # Intercept window close to cancel running uploads
+        page.on_close = self._on_close
+
+    def _on_close(self, e=None):
+        """Cancel running backups when the application window closes."""
+        log = get_logger()
+        log.info("Application closing — cleaning up uploads")
+        backup_page = self._pages.get("backup")
+        if backup_page:
+            self._page_ref.run_task(backup_page.close)
+
     def _refresh(self):
         """Refresh current view after data changes."""
         if "backup" in self._pages:

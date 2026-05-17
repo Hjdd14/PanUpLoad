@@ -12,6 +12,7 @@ build/
 # Project specific
 项目规划.jpg
 test_login_dump.txt
+test_login_dump_*.txt
 flet-windows.zip
 pythonnet-*.tar.gz
 .pytest_cache/
